@@ -1,0 +1,418 @@
+"""server.py — Pinheirinho2 WebSocket Race Server.
+
+Standalone process (runs on the VPS). Accepts any number of connections:
+  - racers: claim a lane (left/right), send telemetry, drive the FSM
+  - spectators: receive every RACE_STATE broadcast (all four beams —
+    pre-stage/stage left/right — light up from the racers' telemetry)
+
+Every client registers as a spectator first and may later upgrade to racer
+by re-REGISTERing with a lane. Lane ownership is exclusive: a claim for an
+occupied lane is answered with LANE_TAKEN and the client stays a spectator.
+
+Usage:
+    pip install websockets
+    python server/server.py
+
+Protocol (client -> server):
+    {"type": "REGISTER", "role": "spectator"}
+    {"type": "REGISTER", "role": "racer", "lane": "left", "track_length": 4123.5}
+    {"type": "REGISTER", "lane": "left"}              # legacy: implies racer
+    {"type": "TELEMETRY", "lane": "left", "pos_x": 1.0, "pos_z": -357.0,
+     "vel": 0.0, "spline": 0.45, "is_prestage": true, "is_stage": false,
+     "timestamp": 1234567890.123}
+
+Protocol (server -> client):
+    {"type": "REGISTER_ACK", "role": "racer", "lane": "left"}
+    {"type": "REGISTER_ACK", "role": "spectator"}
+    {"type": "LANE_TAKEN", "lane": "left"}
+    {"type": "RACE_STATE", "state": {...}}
+    {"type": "OPPONENT_DISCONNECTED", "lane": "left"}
+"""
+import asyncio
+import json
+import logging
+import os
+import sys
+import time
+
+import websockets
+
+# Allow running as `python server/server.py` from repo root
+sys.path.insert(0, os.path.dirname(__file__))
+from race_state_adapter import RaceStateAdapter
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+)
+logger = logging.getLogger('RaceServer')
+
+HOST = '0.0.0.0'
+# Porta: em hosts tipo Pterodactyl a porta e alocada pelo painel e chega
+# via env SERVER_PORT; PIN2_PORT permite override manual; padrao 8765.
+PORT = int(os.environ.get('PIN2_PORT') or os.environ.get('SERVER_PORT') or 8765)
+
+# Auth (env vars, set on the VPS):
+#   PIN2_TOKEN       — optional. If set, REGISTER must carry the same
+#                      'token' or the client stays unregistered.
+#   PIN2_ADMIN_TOKEN — required for ADMIN_RESET. If NOT set, network
+#                      resets are disabled entirely (fail-closed) so a
+#                      random client can never reset races.
+ACCESS_TOKEN = os.environ.get('PIN2_TOKEN') or None
+ADMIN_TOKEN = os.environ.get('PIN2_ADMIN_TOKEN') or None
+TICK_HZ = 120
+TICK_INTERVAL = 1.0 / TICK_HZ
+POST_RACE_RESET_DELAY = 5.0   # seconds to show results before FSM resets
+RUN_WATCHDOG_S = 60.0         # max run duration — force reset if a lane never
+                              # finishes (racer disconnected / crashed mid-run)
+RESULTS_DIR = os.path.join(os.path.dirname(__file__), 'results')
+
+LANES = ('left', 'right')
+
+
+class RaceServer:
+    def __init__(self):
+        self.clients = {}       # websocket -> {'role': 'spectator'|'racer', 'lane': str|None}
+        self.lanes = {}         # lane -> websocket (racers only)
+        self.lane_pilots = {}   # lane -> pilot display name
+        self.adapter = RaceStateAdapter()
+        self._last_broadcast_state = None
+        self._race_ended_at = None
+        self._run_started_at = None
+
+        if not os.path.exists(RESULTS_DIR):
+            os.makedirs(RESULTS_DIR)
+
+    # ------------------------------------------------------------------
+    # Connection handling
+    # ------------------------------------------------------------------
+
+    async def handle_client(self, websocket):
+        info = {'role': None, 'lane': None}
+        self.clients[websocket] = info
+        peer = getattr(websocket, 'remote_address', None)
+        logger.info("Client connected: %s", peer)
+        try:
+            async for raw in websocket:
+                try:
+                    msg = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    logger.warning("Bad JSON from %s", peer)
+                    continue
+
+                mtype = msg.get('type')
+                if mtype == 'REGISTER':
+                    await self._handle_register(websocket, info, msg)
+                elif mtype == 'TELEMETRY':
+                    if info['role'] == 'racer' and info['lane'] is not None:
+                        self.adapter.store_telemetry(info['lane'], msg)
+                    # telemetry from spectators/unregistered is ignored
+                elif mtype == 'CHAT':
+                    # Low-latency app chat: relayed to every client through
+                    # the WS channel (no game-chat delay/rate-limit).
+                    text = str(msg.get('text', ''))[:300]
+                    if text and info['role'] is not None:
+                        sender = self.lane_pilots.get(info.get('lane')) or msg.get('from') or info['role']
+                        await self._broadcast({'type': 'CHAT',
+                                               'from': str(sender)[:64],
+                                               'lane': info.get('lane'),
+                                               'text': text})
+                elif mtype == 'ADMIN_RESET':
+                    # Reset via WS. Fail-closed: only honoured when the VPS
+                    # operator configured PIN2_ADMIN_TOKEN and the message
+                    # carries it — a regular pilot/spectator (or a stray
+                    # wscat) can never reset races.
+                    if ADMIN_TOKEN is None:
+                        logger.warning("ADMIN_RESET rejected (%s): PIN2_ADMIN_TOKEN not configured.", peer)
+                    elif msg.get('admin_token') != ADMIN_TOKEN:
+                        logger.warning("ADMIN_RESET rejected (%s): bad admin token.", peer)
+                    else:
+                        logger.warning("ADMIN_RESET accepted (%s) — resetting FSM.", peer)
+                        self.adapter.reset()
+                        self._race_ended_at = None
+                        self._run_started_at = None
+                        self._last_broadcast_state = None
+                        await self._broadcast({'type': 'ADMIN_RESET'})
+                elif mtype == 'SYNC':
+                    # Clock-sync probe: echo t0, stamp server time. Answered
+                    # inline for minimal latency (accuracy of the tree
+                    # schedule on the clients depends on this).
+                    await self._send(websocket, {
+                        'type': 'SYNC_ACK',
+                        't0': msg.get('t0'),
+                        't1': time.time(),
+                    })
+
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        except Exception as e:
+            logger.exception("Error in handle_client %s: %s", peer, e)
+        finally:
+            self.clients.pop(websocket, None)
+            lane = info.get('lane')
+            if lane is not None and self.lanes.get(lane) is websocket:
+                del self.lanes[lane]
+                self.adapter.clear_lane(lane)
+                self.lane_pilots.pop(lane, None)
+                logger.info("Racer disconnected: lane=%s", lane)
+                await self._broadcast({'type': 'OPPONENT_DISCONNECTED', 'lane': lane})
+            else:
+                logger.info("Client disconnected: %s (role=%s)", peer, info.get('role'))
+
+    async def _handle_register(self, websocket, info, msg):
+        """Handle initial registration and spectator->racer upgrades."""
+        # Optional access gate: with PIN2_TOKEN set, only clients whose
+        # server.ini carries the same token get registered at all.
+        if ACCESS_TOKEN is not None and msg.get('token') != ACCESS_TOKEN:
+            logger.warning("REGISTER rejected: bad/missing access token.")
+            await self._send(websocket, {'type': 'AUTH_FAILED'})
+            return
+
+        role = msg.get('role')
+        lane = msg.get('lane')
+        if role is None:
+            # Legacy clients send only a lane — treat as racer
+            role = 'racer' if lane in LANES else 'spectator'
+
+        if role == 'racer':
+            if lane not in LANES:
+                await self._send(websocket, {'type': 'LANE_TAKEN', 'lane': lane})
+                return
+            owner = self.lanes.get(lane)
+            if owner is not None and owner is not websocket and owner in self.clients:
+                logger.info("Lane claim DENIED (taken): lane=%s", lane)
+                await self._send(websocket, {'type': 'LANE_TAKEN', 'lane': lane})
+                if info['role'] is None:
+                    info['role'] = 'spectator'
+                    await self._send(websocket, {'type': 'REGISTER_ACK', 'role': 'spectator'})
+                    await self._send_current_state(websocket)
+                return
+
+            # Release a previously held lane if switching sides
+            prev = info.get('lane')
+            if prev is not None and prev != lane and self.lanes.get(prev) is websocket:
+                del self.lanes[prev]
+                self.adapter.clear_lane(prev)
+                self.lane_pilots.pop(prev, None)
+
+            info['role'] = 'racer'
+            info['lane'] = lane
+            self.lanes[lane] = websocket
+
+            pilot = msg.get('pilot')
+            if pilot:
+                self.lane_pilots[lane] = str(pilot)[:64]
+
+            track_length = msg.get('track_length')
+            if track_length is not None:
+                try:
+                    self.adapter.set_track_length(lane, float(track_length))
+                except (TypeError, ValueError):
+                    pass
+
+            logger.info("REGISTERED racer lane=%s track_length=%s", lane, track_length)
+            await self._send(websocket, {'type': 'REGISTER_ACK', 'role': 'racer', 'lane': lane})
+            await self._send_current_state(websocket)
+            return
+
+        # Spectator registration (also: racer downgrading to spectator)
+        prev = info.get('lane')
+        if prev is not None and self.lanes.get(prev) is websocket:
+            del self.lanes[prev]
+            self.adapter.clear_lane(prev)
+            self.lane_pilots.pop(prev, None)
+            await self._broadcast({'type': 'OPPONENT_DISCONNECTED', 'lane': prev})
+        info['role'] = 'spectator'
+        info['lane'] = None
+        logger.info("REGISTERED spectator (%d spectators, %d racers)",
+                    sum(1 for i in self.clients.values() if i['role'] == 'spectator'),
+                    len(self.lanes))
+        await self._send(websocket, {'type': 'REGISTER_ACK', 'role': 'spectator'})
+        await self._send_current_state(websocket)
+
+    def _with_pilots(self, state):
+        """Attach the per-lane pilot names to a state dict (in place)."""
+        state['pilots'] = {ln: self.lane_pilots.get(ln) for ln in LANES}
+        return state
+
+    async def _send_current_state(self, websocket):
+        """Send the current state immediately so new clients never wait."""
+        current_state = self._with_pilots(self.adapter.serialize())
+        await self._send(websocket, {'type': 'RACE_STATE', 'state': current_state})
+
+    async def _send(self, websocket, msg):
+        try:
+            await websocket.send(json.dumps(msg))
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Tick loop
+    # ------------------------------------------------------------------
+
+    async def tick_loop(self):
+        """60 Hz FSM update loop."""
+        logger.info("Tick loop started at %d Hz", TICK_HZ)
+        while True:
+            t0 = time.time()
+            await self._tick(t0)
+            elapsed = time.time() - t0
+            await asyncio.sleep(max(0.0, TICK_INTERVAL - elapsed))
+
+    async def _tick(self, now):
+        # Only racers count as active cars (spectators must not affect
+        # the WO/solo staging timeout logic).
+        active_cars = len(self.lanes)
+        state = self._with_pilots(self.adapter.tick(now, active_cars=active_cars))
+
+        # Run watchdog: without it, a racer that disconnects (or stops) mid-run
+        # leaves run_active stuck forever — no lane ever reaches t201/burn, the
+        # race-end detection never fires, and every later race is blocked.
+        if state.get('run_active'):
+            if self._run_started_at is None:
+                self._run_started_at = now
+            elif (now - self._run_started_at) > RUN_WATCHDOG_S and self._race_ended_at is None:
+                logger.warning("Run watchdog: race never finished after %.0fs — forcing reset.",
+                               RUN_WATCHDOG_S)
+                self._save_result(state)
+                self.adapter.reset()
+                self._run_started_at = None
+                self._last_broadcast_state = None
+                return
+        else:
+            self._run_started_at = None
+
+        # Race-end detection: all active, non-wo lanes have either t201 or burned
+        if state.get('run_active') and not state.get('pin_on_fire') and not state.get('timer_running'):
+            active_lanes = [
+                ln for ln in LANES
+                if state['lane_active'].get(ln) and not state['lane_wo'].get(ln)
+            ]
+            if active_lanes and all(
+                state['stats'][ln].get('t201') is not None or state['lane_burned'].get(ln)
+                for ln in active_lanes
+            ):
+                if self._race_ended_at is None:
+                    self._race_ended_at = now
+                    logger.info("Race done. Reset in %.0fs.", POST_RACE_RESET_DELAY)
+                    self._save_result(state)
+
+        if self._race_ended_at is not None and (now - self._race_ended_at) >= POST_RACE_RESET_DELAY:
+            logger.info("Resetting FSM.")
+            self.adapter.reset()
+            self._race_ended_at = None
+            self._last_broadcast_state = None
+
+        # Only broadcast on state change
+        if state == self._last_broadcast_state:
+            return
+        self._log_transitions(self._last_broadcast_state, state)
+        self._last_broadcast_state = state
+
+        await self._broadcast({'type': 'RACE_STATE', 'state': state})
+
+    def _log_transitions(self, prev, cur):
+        """Log human-readable tree events when notable state changes occur."""
+        if prev is None:
+            return
+        prev_lights = prev.get('lights', {}).get('left', {})
+        cur_lights  = cur.get('lights',  {}).get('left', {})
+
+        # run_active rising edge
+        if not prev.get('run_active') and cur.get('run_active'):
+            logger.info(">>> RUN ACTIVE — tree armed")
+
+        # beam transitions (pre-stage / stage, both lanes)
+        for lane in LANES:
+            p = prev.get('lights', {}).get(lane, {})
+            c = cur.get('lights',  {}).get(lane, {})
+            for beam in ('prestage', 'stage'):
+                if not p.get(beam) and c.get(beam):
+                    logger.info(">>> %s %s ON", beam.upper(), lane.upper())
+                elif p.get(beam) and not c.get(beam):
+                    logger.info(">>> %s %s off", beam.upper(), lane.upper())
+
+        # yellows (track each bulb independently)
+        prev_y = prev_lights.get('yellows', [False, False, False])
+        cur_y  = cur_lights.get('yellows',  [False, False, False])
+        for i, label in enumerate(['AMARELO 1', 'AMARELO 2', 'AMARELO 3']):
+            if not prev_y[i] and cur_y[i]:
+                logger.info(">>> %s", label)
+
+        # green rising edge
+        if not prev_lights.get('green') and cur_lights.get('green'):
+            logger.info(">>> VERDE ← largada!")
+
+        # RT registered for either lane
+        for lane in LANES:
+            prev_rt = prev.get('stats', {}).get(lane, {}).get('rt')
+            cur_rt  = cur.get('stats',  {}).get(lane, {}).get('rt')
+            if prev_rt is None and cur_rt is not None:
+                burn = cur.get('stats', {}).get(lane, {}).get('rt_burn', False)
+                tag  = ' [QUEIMA]' if burn else ''
+                logger.info(">>> RT %s = %.4fs%s", lane.upper(), cur_rt, tag)
+
+        # t201 registered for either lane
+        for lane in LANES:
+            prev_t = prev.get('stats', {}).get(lane, {}).get('t201')
+            cur_t  = cur.get('stats',  {}).get(lane, {}).get('t201')
+            if prev_t is None and cur_t is not None:
+                logger.info(">>> 201m %s = %.4fs", lane.upper(), cur_t)
+
+    def _save_result(self, state):
+        """Save the final race state to a JSON file."""
+        try:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = "result_{}.json".format(timestamp)
+            filepath = os.path.join(RESULTS_DIR, filename)
+
+            result = {
+                'timestamp': time.time(),
+                'date': time.ctime(),
+                'state': state
+            }
+
+            with open(filepath, 'w') as f:
+                json.dump(result, f, indent=2)
+            logger.info("Result saved to %s", filepath)
+        except Exception as e:
+            logger.error("Failed to save result: %s", e)
+
+    async def _broadcast(self, msg):
+        if not self.clients:
+            return
+        raw = json.dumps(msg)
+        dead = []
+        for ws in list(self.clients.keys()):
+            try:
+                await ws.send(raw)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            info = self.clients.pop(ws, None)
+            if info and info.get('lane') is not None and self.lanes.get(info['lane']) is ws:
+                del self.lanes[info['lane']]
+                self.adapter.clear_lane(info['lane'])
+                self.lane_pilots.pop(info['lane'], None)
+            logger.warning("Dead client removed during broadcast")
+
+
+async def main():
+    race_server = RaceServer()
+    async with websockets.serve(
+        race_server.handle_client, HOST, PORT,
+        ping_interval=20, ping_timeout=10,
+    ):
+        logger.info("Pinheirinho2 Race Server on ws://%s:%d", HOST, PORT)
+        tick_task = asyncio.create_task(race_server.tick_loop())
+        try:
+            await asyncio.Future()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            tick_task.cancel()
+    logger.info("Server shut down.")
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
