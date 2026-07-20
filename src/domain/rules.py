@@ -433,20 +433,34 @@ class RaceStateMachine:
         # --- Tree Sequence Logic ---
         if self.timer_running:
             for lane in Lane.all():
-                # Bug 3 FIX: Do not skip yellows for burned or WO lanes.
-                # Allow the tree to drop for both sides.
-                
+                # Only the lane(s) with an actual driver run the visual tree.
+                # A walkover lane (nobody staged there — solo run) never got
+                # a "before" from this pilot, so it has nothing to react to:
+                # its yellows stay dark, only the red (set in start_sequence)
+                # marks it as WO. If a second driver later stages and a real
+                # dual-lane run starts, both lanes light up normally (WO is
+                # only set at start_sequence() time, per lane, per run).
+                if self.lane_wo[lane]:
+                    self.lights.yellows[lane] = [False, False, False]
+                    self.lights.green[lane] = False
+                    # Still need this lane's pin_on_fire/finish-sequence
+                    # bookkeeping below to use a real elapsed check, not
+                    # skip the whole loop iteration.
+                    if elapsed >= 2.6:
+                        self.pin_on_fire = False
+                    continue
+
                 # Yellows
                 self.lights.yellows[lane][0] = (1.4 <= elapsed < 1.8)
                 self.lights.yellows[lane][1] = (1.8 <= elapsed < 2.2)
                 self.lights.yellows[lane][2] = (2.2 <= elapsed < 2.6)
-                
+
                 # Green
                 if elapsed >= 2.6:
                     self.pin_on_fire = False  # GREEN just fired
                     if self.green_hold_until[lane] == 0.0:
                         self.green_hold_until[lane] = now + self.GREEN_HOLD_SEC
-                    
+
                 if self.green_hold_until[lane] > 0.0 and now < self.green_hold_until[lane]:
                     # Only show green if they haven't burned/WO
                     if not self.lane_burned[lane] and not self.lane_wo[lane]:
