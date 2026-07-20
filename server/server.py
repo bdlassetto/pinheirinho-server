@@ -78,7 +78,11 @@ ADMIN_TOKEN = os.environ.get('PIN2_ADMIN_TOKEN') or None
 
 TICK_HZ = 120
 TICK_INTERVAL = 1.0 / TICK_HZ
-POST_RACE_RESET_DELAY = 5.0   # seconds to show results before FSM resets
+POST_RACE_RESET_DELAY = 5.0   # max seconds to show results before FSM resets
+MIN_RESET_SETTLE_S = 0.5      # min time after race-end before an early
+                              # realign-triggered reset is honoured — the
+                              # burned car is still sitting on the beam at
+                              # t=0, this avoids reading that as "returned"
 RUN_WATCHDOG_S = 60.0         # max run duration — force reset if a lane never
                               # finishes (racer disconnected / crashed mid-run)
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), 'results')
@@ -99,6 +103,12 @@ class Room:
         self.last_broadcast = None
         self.race_ended_at = None
         self.run_started_at = None
+        # Early-reset-on-realign: lanes that need to re-stage before the
+        # next run, and which of those we've actually seen LEAVE the beam
+        # since the race ended (so a driver still sitting on the line from
+        # the burn itself can't instantly flicker the tree back down).
+        self.finished_lanes = set()
+        self.lanes_confirmed_departed = set()
 
 
 class RaceServer:
@@ -191,6 +201,8 @@ class RaceServer:
                         room.adapter.reset()
                         room.race_ended_at = None
                         room.run_started_at = None
+                        room.finished_lanes = set()
+                        room.lanes_confirmed_departed = set()
                         room.last_broadcast = None
                         await self._broadcast(room, {'type': 'ADMIN_RESET'})
                 elif mtype == 'SYNC':
@@ -350,6 +362,8 @@ class RaceServer:
                 self._save_result(room, state)
                 room.adapter.reset()
                 room.run_started_at = None
+                room.finished_lanes = set()
+                room.lanes_confirmed_departed = set()
                 room.last_broadcast = None
                 return
         else:
@@ -367,14 +381,36 @@ class RaceServer:
             ):
                 if room.race_ended_at is None:
                     room.race_ended_at = now
-                    logger.info("Race done (room=%s). Reset in %.0fs.", room.key, POST_RACE_RESET_DELAY)
+                    room.finished_lanes = set(active_lanes)
+                    room.lanes_confirmed_departed = set()
+                    logger.info("Race done (room=%s). Reset in up to %.0fs (sooner if driver(s) realign).",
+                                room.key, POST_RACE_RESET_DELAY)
                     self._save_result(room, state)
 
-        if room.race_ended_at is not None and (now - room.race_ended_at) >= POST_RACE_RESET_DELAY:
-            logger.info("Resetting FSM (room=%s).", room.key)
-            room.adapter.reset()
-            room.race_ended_at = None
-            room.last_broadcast = None
+        if room.race_ended_at is not None:
+            # Track which finished lanes have actually left the beam since
+            # the race ended — required before an early reset counts a
+            # lane as "back and ready" (prevents the still-parked-from-the-
+            # burn car from instantly re-arming the tree).
+            for ln in room.finished_lanes:
+                if not room.adapter.is_lane_fully_staged(ln):
+                    room.lanes_confirmed_departed.add(ln)
+
+            elapsed_since_end = now - room.race_ended_at
+            realigned_early = (
+                elapsed_since_end >= MIN_RESET_SETTLE_S
+                and room.finished_lanes
+                and room.finished_lanes <= room.lanes_confirmed_departed
+                and all(room.adapter.is_lane_fully_staged(ln) for ln in room.finished_lanes)
+            )
+            if realigned_early or elapsed_since_end >= POST_RACE_RESET_DELAY:
+                logger.info("Resetting FSM (room=%s)%s.", room.key,
+                            " — driver realigned" if realigned_early else "")
+                room.adapter.reset()
+                room.race_ended_at = None
+                room.finished_lanes = set()
+                room.lanes_confirmed_departed = set()
+                room.last_broadcast = None
 
         # Only broadcast on state change
         if state == room.last_broadcast:

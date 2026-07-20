@@ -55,6 +55,16 @@ class RaceStateAdapter:
             data.get('is_stage', False),
         )
 
+    def is_lane_fully_staged(self, lane):
+        """True if this lane's latest telemetry shows both pre-stage and
+        stage beams lit — i.e. the driver is sitting fully staged right
+        now. Used to let a lane re-arm as soon as its driver realigns,
+        instead of waiting out a fixed post-race timer."""
+        tel = self._telemetry.get(lane)
+        if tel is None:
+            return False
+        return bool(tel.get('is_prestage')) and bool(tel.get('is_stage'))
+
     def clear_lane(self, lane):
         """Drop a lane's telemetry and zero its beams (racer disconnected).
 
