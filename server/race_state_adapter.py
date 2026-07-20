@@ -55,14 +55,23 @@ class RaceStateAdapter:
             data.get('is_stage', False),
         )
 
-    def is_lane_fully_staged(self, lane):
+    def is_lane_fully_staged(self, lane, now=None):
         """True if this lane's latest telemetry shows both pre-stage and
         stage beams lit — i.e. the driver is sitting fully staged right
         now. Used to let a lane re-arm as soon as its driver realigns,
-        instead of waiting out a fixed post-race timer."""
+        instead of waiting out a fixed post-race timer.
+
+        With `now`, telemetry older than TELEMETRY_FRESH_S counts as NOT
+        staged (a frozen app can't hold a lane 'aligned' forever)."""
         tel = self._telemetry.get(lane)
         if tel is None:
             return False
+        if now is not None:
+            try:
+                if now - float(tel.get('timestamp', 0.0)) > self.TELEMETRY_FRESH_S:
+                    return False
+            except (TypeError, ValueError):
+                return False
         return bool(tel.get('is_prestage')) and bool(tel.get('is_stage'))
 
     def clear_lane(self, lane):
@@ -74,11 +83,25 @@ class RaceStateAdapter:
         self._telemetry.pop(lane, None)
         self.race_machine.update_sensor_state(lane, False, False)
 
+    TELEMETRY_FRESH_S = 1.0   # telemetria mais velha que isso = sensor apagado
+
     def tick(self, now, active_cars=2):
         """Run one FSM update cycle and return serialized state dict.
 
         Call at a fixed rate (e.g., 60 Hz) from the server event loop.
         """
+        # Frescor: um app congelado (ou uma ponte que reenviou um frame
+        # antigo) nao pode deixar o feixe travado aceso — telemetria sem
+        # atualizacao ha mais de TELEMETRY_FRESH_S conta como sensor OFF.
+        for _lane, _tel in list(self._telemetry.items()):
+            try:
+                _age = now - float(_tel.get('timestamp', 0.0))
+            except (TypeError, ValueError):
+                _age = self.TELEMETRY_FRESH_S + 1.0
+            if _age > self.TELEMETRY_FRESH_S:
+                if self.race_machine.car_prestage.get(_lane) or self.race_machine.car_stage.get(_lane):
+                    self.race_machine.update_sensor_state(_lane, False, False)
+
         # 1. Timer-start rising-edge detection (reads state from PREVIOUS update())
         timer_running = self.race_machine.timer_running
         if timer_running and not self._prev_timer_running:

@@ -89,6 +89,7 @@ RESULTS_DIR = os.path.join(os.path.dirname(__file__), 'results')
 
 LANES = ('left', 'right')
 DEFAULT_ROOM = 'default'
+MAX_ROOMS = 50   # protecao contra criacao ilimitada de salas por clientes
 
 
 class Room:
@@ -183,7 +184,11 @@ class RaceServer:
                     room = self.rooms.get(info.get('room'))
                     text = str(msg.get('text', ''))[:300]
                     if room and text and info['role'] is not None:
-                        sender = room.lane_pilots.get(info.get('lane')) or msg.get('from') or info['role']
+                        # Remetente confiavel: nome registrado na conexao
+                        # (REGISTER), nunca o campo 'from' da mensagem —
+                        # espectador nao consegue se passar por outro nome
+                        sender = (room.lane_pilots.get(info.get('lane'))
+                                  or info.get('pilot') or info['role'])
                         await self._broadcast(room, {'type': 'CHAT',
                                                      'from': str(sender)[:64],
                                                      'lane': info.get('lane'),
@@ -240,6 +245,38 @@ class RaceServer:
 
         room_key = str(msg.get('room') or DEFAULT_ROOM)[:80]
 
+        role = msg.get('role')
+        lane = msg.get('lane')
+        if role is None:
+            # Legacy clients send only a lane — treat as racer
+            role = 'racer' if lane in LANES else 'spectator'
+
+        # Guarda o pilot informado na conexao (usado como remetente
+        # confiavel do CHAT, inclusive para espectadores)
+        pilot_field = msg.get('pilot')
+        if pilot_field:
+            info['pilot'] = str(pilot_field)[:64]
+
+        # No-op re-REGISTER (keepalive de papel do cliente, a cada ~8s):
+        # mesma conexao, mesma sala, mesmo papel e mesma lane — responde um
+        # ACK silencioso sem log INFO nem reenvio do estado completo, para
+        # nao poluir o log nem gastar banda a toa.
+        if (info.get('room') == room_key and info.get('role') == role
+                and (role != 'racer' or info.get('lane') == lane)):
+            ack = {'type': 'REGISTER_ACK', 'role': role}
+            if role == 'racer':
+                ack['lane'] = lane
+            await self._send(websocket, ack)
+            return
+
+        # Room cap: recusa sala NOVA acima do limite (salas existentes
+        # continuam aceitando entradas normalmente)
+        if room_key not in self.rooms and len(self.rooms) >= MAX_ROOMS:
+            logger.warning("REGISTER rejected: room cap reached (%d), room=%s",
+                           MAX_ROOMS, room_key)
+            await self._send(websocket, {'type': 'AUTH_FAILED'})
+            return
+
         # Room switch (e.g. pilot changed AC server): leave the old room
         if info.get('room') is not None and info['room'] != room_key:
             left = self._leave_room(websocket, info)
@@ -252,12 +289,6 @@ class RaceServer:
         room = self._get_room(room_key)
         room.clients[websocket] = info
         info['room'] = room_key
-
-        role = msg.get('role')
-        lane = msg.get('lane')
-        if role is None:
-            # Legacy clients send only a lane — treat as racer
-            role = 'racer' if lane in LANES else 'spectator'
 
         if role == 'racer':
             if lane not in LANES:
@@ -393,7 +424,7 @@ class RaceServer:
             # lane as "back and ready" (prevents the still-parked-from-the-
             # burn car from instantly re-arming the tree).
             for ln in room.finished_lanes:
-                if not room.adapter.is_lane_fully_staged(ln):
+                if not room.adapter.is_lane_fully_staged(ln, now):
                     room.lanes_confirmed_departed.add(ln)
 
             elapsed_since_end = now - room.race_ended_at
@@ -401,7 +432,7 @@ class RaceServer:
                 elapsed_since_end >= MIN_RESET_SETTLE_S
                 and room.finished_lanes
                 and room.finished_lanes <= room.lanes_confirmed_departed
-                and all(room.adapter.is_lane_fully_staged(ln) for ln in room.finished_lanes)
+                and all(room.adapter.is_lane_fully_staged(ln, now) for ln in room.finished_lanes)
             )
             if realigned_early or elapsed_since_end >= POST_RACE_RESET_DELAY:
                 logger.info("Resetting FSM (room=%s)%s.", room.key,
@@ -506,6 +537,11 @@ class RaceServer:
                 room.adapter.clear_lane(info['lane'])
                 room.lane_pilots.pop(info['lane'], None)
             logger.warning("Dead client removed during broadcast (room=%s)", room.key)
+        # Sala que esvaziou por clientes mortos: sem isso ela ficaria
+        # tickando a 120Hz para sempre (leak de CPU/memoria)
+        if dead and not room.clients and self.rooms.get(room.key) is room:
+            del self.rooms[room.key]
+            logger.info("Room removed (empty, dead-broadcast): %s", room.key)
 
 
 async def main():

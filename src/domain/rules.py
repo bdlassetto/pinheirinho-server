@@ -14,14 +14,9 @@ Key behaviors:
   - Pre-stage/Stage lights continue to reflect sensor state even after
     a burn, giving the driver visual reference.
 """
-from domain.models import Lane, StageState
+from domain.models import Lane
 from infrastructure.logger import FileLogger
 import math
-
-class LightState:
-    OFF = 0
-    ON = 1
-
 
 def predict_tree_lights(elapsed, duration=2.6, green_hold_s=1.2):
     """Pure schedule function: tree bulbs for a given time since timer_start.
@@ -67,7 +62,6 @@ class TreeLights:
 
 class RaceStateMachine:
     def __init__(self, false_move_threshold=0.25):
-        self.state = StageState.IDLE
         self.lights = TreeLights()
         self.timer_start = 0.0
         self.timer_duration = 2.6
@@ -122,7 +116,6 @@ class RaceStateMachine:
         # --- Red Light Clearing ---
         # cleared.
         self.RED_CLEAR_COOLDOWN_S = 8.0
-        self.red_clear_allowed = {Lane.LEFT: False, Lane.RIGHT: False}
         self.lane_had_full_stage = {Lane.LEFT: False, Lane.RIGHT: False}
 
     def update_sensor_state(self, lane, is_prestage, is_stage):
@@ -133,7 +126,6 @@ class RaceStateMachine:
 
     def reset(self):
         """Full reset of race state — clears all timers, flags, and lights."""
-        self.state = StageState.IDLE
         self.timer_running = False
         self.run_active = False
         self.pin_on_fire = False
@@ -160,7 +152,6 @@ class RaceStateMachine:
         self.lane_unstage_time = {Lane.LEFT: None, Lane.RIGHT: None}
         
         # Red light clearing
-        self.red_clear_allowed = {Lane.LEFT: False, Lane.RIGHT: False}
         self.lane_had_full_stage = {Lane.LEFT: False, Lane.RIGHT: False}
         
         self.lights.reset()
@@ -277,8 +268,7 @@ class RaceStateMachine:
             return
         self.lane_burned[lane] = True
         self.lane_burn_time[lane] = now
-        self.red_clear_allowed[lane] = False  # Must wait cooldown
-        
+
         # Set red light, turn off green, but ALLOW yellows to animate
         self.lights.red[lane] = True
         self.lights.green[lane] = False
@@ -316,23 +306,23 @@ class RaceStateMachine:
         """
         if not self.lane_burned[lane]:
             return False
-        
+
         if not self.lights.red[lane]:
             return False  # Already cleared
-        
+
         # Compute time since green fired
         green_time = self.timer_start + self.timer_duration
         if now - green_time < self.RED_CLEAR_COOLDOWN_S:
             return False  # Still in cooldown
-        
-        # Cooldown passed — allow clearing
-        self.red_clear_allowed[lane] = True
-        
-        if self.red_clear_allowed[lane]:
-            self.lights.red[lane] = False
-            return True
-        
-        return False
+
+        # Rule 3 (was documented but never enforced): the driver must be
+        # back on the pre-stage sensor — the red must not clear by time
+        # alone with the car anywhere on the track.
+        if not is_on_prestage:
+            return False
+
+        self.lights.red[lane] = False
+        return True
 
     def update(self, now, active_cars=2):
         self.current_time = now
@@ -450,10 +440,12 @@ class RaceStateMachine:
                         self.pin_on_fire = False
                     continue
 
-                # Yellows
-                self.lights.yellows[lane][0] = (1.4 <= elapsed < 1.8)
-                self.lights.yellows[lane][1] = (1.8 <= elapsed < 2.2)
-                self.lights.yellows[lane][2] = (2.2 <= elapsed < 2.6)
+                # Yellows — mesma fonte de verdade da renderizacao
+                # agendada nos clientes (predict_tree_lights); evita as
+                # janelas duplicarem/divergirem entre FSM e countdown local
+                yellows, _ = predict_tree_lights(elapsed, self.timer_duration,
+                                                 self.GREEN_HOLD_SEC)
+                self.lights.yellows[lane] = list(yellows)
 
                 # Green
                 if elapsed >= 2.6:
@@ -476,11 +468,6 @@ class RaceStateMachine:
                 for lane in Lane.all():
                     self.lights.yellows[lane] = [False, False, False]
                     self.lights.green[lane] = False
-
-    def set_red_light(self, lane):
-        self.lights.red[lane] = True
-        self.lights.green[lane] = False
-        self.lights.yellows[lane] = [False, False, False]
 
     # Timing Logic
     def get_race_start_time(self):

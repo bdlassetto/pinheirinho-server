@@ -77,7 +77,7 @@ class TimingEngine:
         """Detects launch event (RT) for one lane.
 
         Parameters:
-          on_launched(lane, rt, spline_s0) — callback when RT is detected
+          on_launched(lane, rt)           — callback when RT is detected
           on_late_burn(lane, now)         — callback when rt < 0 (late catch)
         """
         if not self.lane_timer_active[lane]:
