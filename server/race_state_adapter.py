@@ -39,8 +39,21 @@ class RaceStateAdapter:
     # ------------------------------------------------------------------
 
     def set_track_length(self, lane, length):
-        """Set track length (metres) for a lane — used for spline-based distance."""
-        self.track_length[lane] = float(length)
+        """Set track length (metres) for a lane — used for spline-based distance.
+
+        Aceita None para LIMPAR o valor: um piloto que entra sem informar
+        track_length nao pode herdar o do piloto anterior naquela lane. Com
+        um track_length residual, o calculo de distancia troca para o modo
+        spline; se o app daquele piloto nao fornece spline (manda None/0),
+        a distancia fica presa em zero e NENHUMA parcial dispara.
+        """
+        if length is None:
+            self.track_length[lane] = None
+            return
+        try:
+            self.track_length[lane] = float(length)
+        except (TypeError, ValueError):
+            self.track_length[lane] = None
 
     def store_telemetry(self, lane, data):
         """Store latest raw telemetry dict and update FSM sensor booleans.
@@ -82,6 +95,10 @@ class RaceStateAdapter:
         """
         self._telemetry.pop(lane, None)
         self.race_machine.update_sensor_state(lane, False, False)
+        # Zera tambem o track_length: ele pertence ao piloto que ocupava a
+        # lane, nao a lane. Sem isso o proximo piloto herdava o valor e
+        # podia cair no modo spline sem ter spline (parciais nunca contam).
+        self.track_length[lane] = None
 
     TELEMETRY_FRESH_S = 1.0   # telemetria mais velha que isso = sensor apagado
 

@@ -81,7 +81,25 @@ class TimingEngine:
           on_late_burn(lane, now)         — callback when rt < 0 (late catch)
         """
         if not self.lane_timer_active[lane]:
-            self._lane_unstage_tracker[lane] = None
+            # ANTES DO VERDE. Continua rastreando a saida do feixe enquanto a
+            # arvore corre. Antes isso era zerado a cada frame: quem largava
+            # antes do verde tinha o instante da saida esquecido e, no verde,
+            # o rastreio recomecava do zero — 0.1s depois concluia "saiu
+            # agora", com launch_time == instante do verde, gerando RT 0.000
+            # (largada PERFEITA) para uma largada QUEIMADA. Confirmado ao
+            # vivo: piloto queimou e recebeu rt=0.0 com lane_burned=False.
+            # Guardando o instante real da saida, o RT sai negativo assim que
+            # o verde acende e cai no caminho de burn (on_late_burn).
+            if (self._rm.run_active and self._rm.timer_running
+                    and not self._rm.lane_burned.get(lane, False)
+                    and not self._rm.lane_wo.get(lane, False)):
+                if not is_staged:
+                    if self._lane_unstage_tracker[lane] is None:
+                        self._lane_unstage_tracker[lane] = now
+                else:
+                    self._lane_unstage_tracker[lane] = None
+            else:
+                self._lane_unstage_tracker[lane] = None
             return
         if self._rm.lane_burned.get(lane, False) or self._rm.lane_wo.get(lane, False):
             self._lane_unstage_tracker[lane] = None
@@ -114,7 +132,11 @@ class TimingEngine:
             rt = launch_time - green_time
 
             if rt < 0.0 and self._rm.run_active:
-                on_late_burn(lane, now)
+                # Carimba a queimada no instante REAL da saida do feixe
+                # (launch_time), nao em 'now': get_burn_rt() mede o quanto
+                # o piloto adiantou em relacao ao verde, entao usar 'now'
+                # (ja depois do verde) zerava esse avanco.
+                on_late_burn(lane, launch_time)
                 return
 
             self.lane_stats[lane]["rt"] = rt

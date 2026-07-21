@@ -319,12 +319,17 @@ class RaceServer:
             if pilot:
                 room.lane_pilots[lane] = str(pilot)[:64]
 
+            # Sempre grava o track_length da lane — INCLUSIVE None. Antes so
+            # gravava quando vinha um valor, entao um piloto que entrasse sem
+            # track_length herdava o do piloto anterior naquela lane; com esse
+            # residuo o calculo de parciais troca para o modo spline e, sem
+            # spline do app, trava em distancia zero (nenhuma parcial conta).
             track_length = msg.get('track_length')
-            if track_length is not None:
-                try:
-                    room.adapter.set_track_length(lane, float(track_length))
-                except (TypeError, ValueError):
-                    pass
+            try:
+                room.adapter.set_track_length(
+                    lane, None if track_length is None else float(track_length))
+            except (TypeError, ValueError):
+                room.adapter.set_track_length(lane, None)
 
             logger.info("REGISTERED racer room=%s lane=%s pilot=%s track_length=%s",
                         room.key, lane, pilot, track_length)
