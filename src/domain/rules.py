@@ -61,7 +61,7 @@ class TreeLights:
         self.red = {Lane.LEFT: False, Lane.RIGHT: False}
 
 class RaceStateMachine:
-    def __init__(self, false_move_threshold=0.25):
+    def __init__(self, false_move_threshold=0.10):
         self.lights = TreeLights()
         self.timer_start = 0.0
         self.timer_duration = 2.6
@@ -103,17 +103,13 @@ class RaceStateMachine:
         self.lane_burn_time = {Lane.LEFT: None, Lane.RIGHT: None}
         
         # --- Burn detection state ---
-        self.FALSEMOVE_DIST_M = false_move_threshold  # Tolerance for position drift while staged
-        self.lane_prev_staged = {Lane.LEFT: False, Lane.RIGHT: False}
+        # Distancia minima (m) do carro em relacao a posicao onde ficou
+        # parado no arme da arvore para considerar queima. Unica regra: antes
+        # do verde, mover >= FALSEMOVE_DIST_M e queima instantanea (ver
+        # check_burn). 10cm por padrao.
+        self.FALSEMOVE_DIST_M = false_move_threshold
         self.lane_stage_pos0 = {Lane.LEFT: None, Lane.RIGHT: None}
-        
-        # --- Stage Grace Period (1s) ---
-        # When a car unstages during yellows, we don't burn immediately.
-        # Instead, we record when it first unstaged and give 1 second
-        # for the driver to re-align before burning.
-        self.UNSTAGE_GRACE_S = 0.1
-        self.lane_unstage_time = {Lane.LEFT: None, Lane.RIGHT: None}
-        
+
         # --- Red Light Clearing ---
         # A luz vermelha (queima) apaga assim que o piloto volta e acende o
         # PRE-STAGE. Guarda: o carro precisa ter SAIDO do feixe desde a
@@ -156,12 +152,8 @@ class RaceStateMachine:
         self.lane_burned = {Lane.LEFT: False, Lane.RIGHT: False}
         self.lane_burn_time = {Lane.LEFT: None, Lane.RIGHT: None}
         self.lane_departed_since_burn = {Lane.LEFT: False, Lane.RIGHT: False}
-        self.lane_prev_staged = {Lane.LEFT: False, Lane.RIGHT: False}
         self.lane_stage_pos0 = {Lane.LEFT: None, Lane.RIGHT: None}
-        
-        # Grace period
-        self.lane_unstage_time = {Lane.LEFT: None, Lane.RIGHT: None}
-        
+
         # Red light clearing
         self.lane_had_full_stage = {Lane.LEFT: False, Lane.RIGHT: False}
         
@@ -203,17 +195,27 @@ class RaceStateMachine:
     def set_stage_position(self, lane, pos):
         """Records the position where the car was staged at tree start."""
         self.lane_stage_pos0[lane] = pos
-        self.lane_prev_staged[lane] = True
 
     def check_burn(self, lane, current_pos, is_staged, now):
         """
         Checks if this lane has false-started (burn).
 
-        Two triggers:
-          1. Unstage: car was on the beam but left it.
-             → 0.1-second grace period: prevents jitter burns but accurately traps jump starts.
-          2. False movement: car still "staged" but physically
-             moved > FALSEMOVE_DIST_M from its stage position.
+        REGRA UNICA: enquanto ANTES do verde (pin_on_fire=True), se o carro
+        se mover >= FALSEMOVE_DIST_M (10cm por padrao) em relacao a posicao
+        onde ficou parado no arme da arvore, e queima — na hora, sem debounce
+        nem depender do sensor de stage desligar.
+
+        Substituiu o mecanismo anterior (unstage do feixe + grace de 0.1s
+        competindo com um segundo rastreador independente em timing_engine).
+        Aquele desenho tinha uma corrida entre dois caminhos de deteccao
+        (um por sensor, outro por distancia+velocidade) que podia deixar uma
+        largada queimada escapar como reacao valida quase zero — visto ao
+        vivo. Posicao pura e instantanea elimina a corrida: sair da caixa do
+        feixe sempre implica mais de 10cm de deslocamento, entao esse caso
+        continua coberto, so que sem a janela de espera.
+
+        `is_staged` fica no parametro so por compatibilidade de assinatura
+        com os chamadores (nao participa mais da decisao).
 
         Returns True if a burn is detected.
         No AC dependencies — App layer provides telemetry.
@@ -221,51 +223,26 @@ class RaceStateMachine:
         # Fast fail checks
         if not self.lane_active[lane] or self.lane_wo[lane] or self.lane_burned[lane]:
             return False
-        
+
         # Only check during yellows (pin_on_fire = tree active, not yet green)
         if not self.pin_on_fire:
             return False
-        
-        # 1. Unstage detection with GRACE PERIOD (debounce)
-        if self.lane_prev_staged[lane] and not is_staged:
-            # Car just left the beam — start grace timer if not already started
-            if self.lane_unstage_time[lane] is None:
-                self.lane_unstage_time[lane] = now
-            
-            # Check if grace period expired
-            elapsed_unstaged = now - self.lane_unstage_time[lane]
-            if elapsed_unstaged >= self.UNSTAGE_GRACE_S:
-                # Grace expired → BURN with the timestamp they left the line
-                self._set_burn_lane(lane, self.lane_unstage_time[lane])
-                self.lane_prev_staged[lane] = False
-                self.lane_unstage_time[lane] = None
-                return True
-            else:
-                # Still within grace period — don't burn yet
-                return False
-        
-        # Car is currently staged — reset grace timer if it was running
-        if is_staged and self.lane_unstage_time[lane] is not None:
-            self.lane_unstage_time[lane] = None  # Re-aligned successfully
-        
-        self.lane_prev_staged[lane] = bool(is_staged)
-        
-        # 2. False movement: still "staged" but moved too far
+
         start = self.lane_stage_pos0[lane]
         if start is None or current_pos is None:
             return False
-        
+
         dx = current_pos[0] - start[0]
         dy = current_pos[1] - start[1]
         dz = current_pos[2] - start[2]
         dist_sq = dx*dx + dy*dy + dz*dz
-        
+
         if dist_sq >= self.FALSEMOVE_DIST_M * self.FALSEMOVE_DIST_M:
             FileLogger.critical("BURN DETECTED: lane={} shifted {:.3f}m (limit {:.2f}m) before green".format(
                 lane, math.sqrt(dist_sq), self.FALSEMOVE_DIST_M))
             self._set_burn_lane(lane, now)
             return True
-        
+
         return False
 
     def _set_burn_lane(self, lane, now):
