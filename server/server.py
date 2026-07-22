@@ -131,6 +131,44 @@ class RaceServer:
             logger.info("Room created: %s", key)
         return room
 
+    def _resolve_lane_on_disconnect(self, room, lane):
+        """Racer caiu no MEIO de um run ativo: resolve a lane dele.
+
+        Sem isto, a lane continuava 'ativa e nao resolvida' — a deteccao de
+        fim de corrida exige t201/queima/realinhamento, todos impossiveis
+        sem telemetria — e a corrida (incluindo o oponente que completou)
+        ficava presa ate o watchdog de 60s. Marcar a lane como WO tambem
+        impede que um NOVO piloto que reivindique essa lane no meio do run
+        herde stage_pos0/rt/queima do ocupante anterior (tempos espurios):
+        lane WO e excluida de RT/queima/parciais ate o reset.
+
+        Se a lane ja RESOLVEU (t201 ou queima), o resultado dela fica de pe
+        — desconectar depois de cruzar a linha nao apaga o tempo.
+        """
+        rm = room.adapter.race_machine
+        if not rm.run_active or lane is None:
+            return
+        if not rm.lane_active.get(lane) or rm.lane_wo.get(lane):
+            return
+        stats = room.adapter.timing_engine.lane_stats.get(lane) or {}
+        if stats.get('t201') is not None or rm.lane_burned.get(lane):
+            return   # ja resolvida — resultado registrado permanece
+        rm.lane_wo[lane] = True
+        rm.lights.red[lane] = False
+        rm.lights.green[lane] = False
+        rm.lights.yellows[lane] = [False, False, False]
+        logger.info("Racer da lane %s caiu no meio do run — lane resolvida por desconexao.", lane)
+        # Nenhuma lane ativa nao-WO sobrou? Encerra a corrida agora, em vez
+        # de deixar a sala presa ate o watchdog.
+        if not any(rm.lane_active.get(l) and not rm.lane_wo.get(l) for l in LANES):
+            logger.info("Nenhuma lane ativa restante (room=%s) — reset imediato.", room.key)
+            room.adapter.reset()
+            room.run_started_at = None
+            room.race_ended_at = None
+            room.finished_lanes = set()
+            room.lanes_confirmed_departed = set()
+            room.last_broadcast = None
+
     def _leave_room(self, websocket, info):
         """Remove a connection from its room, releasing its lane."""
         room_key = info.get('room')
@@ -145,6 +183,7 @@ class RaceServer:
         freed_lane = None
         if lane is not None and room.lanes.get(lane) is websocket:
             del room.lanes[lane]
+            self._resolve_lane_on_disconnect(room, lane)
             room.adapter.clear_lane(lane)
             room.lane_pilots.pop(lane, None)
             freed_lane = lane
@@ -558,6 +597,7 @@ class RaceServer:
             info = room.clients.pop(ws, None)
             if info and info.get('lane') is not None and room.lanes.get(info['lane']) is ws:
                 del room.lanes[info['lane']]
+                self._resolve_lane_on_disconnect(room, info['lane'])
                 room.adapter.clear_lane(info['lane'])
                 room.lane_pilots.pop(info['lane'], None)
             logger.warning("Dead client removed during broadcast (room=%s)", room.key)

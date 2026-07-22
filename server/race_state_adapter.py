@@ -31,6 +31,7 @@ class RaceStateAdapter:
         )
         self.track_length = {Lane.LEFT: None, Lane.RIGHT: None}
         self._telemetry = {}       # lane -> latest telemetry dict
+        self._event_now_prev = {}  # lane -> ultimo tempo-de-evento (monotonico)
         self._prev_pin_on_fire = True
         self._prev_timer_running = False
 
@@ -68,6 +69,54 @@ class RaceStateAdapter:
             data.get('is_stage', False),
         )
 
+    def _tel_age(self, tel, now):
+        """Idade da telemetria vista pelo servidor.
+
+        Prefere ts_srv (carimbo do cliente ja convertido para o relogio do
+        SERVIDOR via offset NTP): a idade vira a latencia real do caminho,
+        imune a skew de relogio entre PCs. Sem ts_srv (cliente antigo ou
+        pre-sync), cai no timestamp local cru — comportamento antigo, que
+        quebrava com skew > TELEMETRY_FRESH_S (piloto nunca 'staged' ou
+        anti-fantasma desativado)."""
+        ts = tel.get('ts_srv')
+        if ts is not None:
+            try:
+                return now - float(ts)
+            except (TypeError, ValueError):
+                pass
+        try:
+            return now - float(tel.get('timestamp', 0.0))
+        except (TypeError, ValueError):
+            return self.TELEMETRY_FRESH_S + 1.0
+
+    def _event_now(self, lane, tel, now):
+        """Instante do EVENTO descrito pela telemetria vigente, no relogio
+        do servidor. E o que torna RT/queima/parciais justos entre pings
+        diferentes: o evento e cronometrado quando ACONTECEU no cliente
+        (ts_srv), nao quando o pacote CHEGOU aqui — sem isso, ping 200ms
+        somava ~0.1s deterministicos ao RT daquele piloto.
+
+        Guardas: sanidade (|now-ts| > TS_SRV_SANITY_S descarta carimbo
+        podre e usa a chegada), nunca no futuro do servidor, e monotonico
+        por lane (nao regride). Sem ts_srv: comporta como antes (chegada).
+        """
+        t = None
+        ts = tel.get('ts_srv')
+        if ts is not None:
+            try:
+                t = float(ts)
+            except (TypeError, ValueError):
+                t = None
+        if t is None or abs(now - t) > self.TS_SRV_SANITY_S:
+            t = now
+        if t > now:
+            t = now
+        prev = self._event_now_prev.get(lane)
+        if prev is not None and t < prev:
+            t = prev
+        self._event_now_prev[lane] = t
+        return t
+
     def is_lane_fully_staged(self, lane, now=None):
         """True if this lane's latest telemetry shows both pre-stage and
         stage beams lit — i.e. the driver is sitting fully staged right
@@ -80,10 +129,7 @@ class RaceStateAdapter:
         if tel is None:
             return False
         if now is not None:
-            try:
-                if now - float(tel.get('timestamp', 0.0)) > self.TELEMETRY_FRESH_S:
-                    return False
-            except (TypeError, ValueError):
+            if self._tel_age(tel, now) > self.TELEMETRY_FRESH_S:
                 return False
         return bool(tel.get('is_prestage')) and bool(tel.get('is_stage'))
 
@@ -94,6 +140,7 @@ class RaceStateAdapter:
         pre-stage/stage lights latched on for every remaining client.
         """
         self._telemetry.pop(lane, None)
+        self._event_now_prev.pop(lane, None)
         self.race_machine.update_sensor_state(lane, False, False)
         # Zera tambem o track_length: ele pertence ao piloto que ocupava a
         # lane, nao a lane. Sem isso o proximo piloto herdava o valor e
@@ -101,6 +148,7 @@ class RaceStateAdapter:
         self.track_length[lane] = None
 
     TELEMETRY_FRESH_S = 1.0   # telemetria mais velha que isso = sensor apagado
+    TS_SRV_SANITY_S = 2.0     # carimbo ts_srv fora disso do relogio local = descartado
 
     def tick(self, now, active_cars=2):
         """Run one FSM update cycle and return serialized state dict.
@@ -111,11 +159,7 @@ class RaceStateAdapter:
         # antigo) nao pode deixar o feixe travado aceso — telemetria sem
         # atualizacao ha mais de TELEMETRY_FRESH_S conta como sensor OFF.
         for _lane, _tel in list(self._telemetry.items()):
-            try:
-                _age = now - float(_tel.get('timestamp', 0.0))
-            except (TypeError, ValueError):
-                _age = self.TELEMETRY_FRESH_S + 1.0
-            if _age > self.TELEMETRY_FRESH_S:
+            if self._tel_age(_tel, now) > self.TELEMETRY_FRESH_S:
                 if self.race_machine.car_prestage.get(_lane) or self.race_machine.car_stage.get(_lane):
                     self.race_machine.update_sensor_state(_lane, False, False)
 
@@ -140,8 +184,12 @@ class RaceStateAdapter:
                     continue
                 pos = (tel.get('pos_x', 0.0), 0.0, tel.get('pos_z', 0.0))
                 is_staged = tel.get('is_stage', False)
-                if self.race_machine.check_burn(lane, pos, is_staged, now):
-                    self.timing_engine.handle_burn(lane, now)
+                # Tempo de EVENTO (ts_srv), nao de chegada: a queima e
+                # carimbada no instante em que o carro saiu/moveu no
+                # cliente — o avanco real nao e mais mascarado pelo ping.
+                ev = self._event_now(lane, tel, now)
+                if self.race_machine.check_burn(lane, pos, is_staged, ev):
+                    self.timing_engine.handle_burn(lane, ev)
 
         # 4. Red-light clearing
         if self.race_machine.run_active:
@@ -151,7 +199,9 @@ class RaceStateAdapter:
                 tel = self._telemetry.get(lane)
                 if tel is None:
                     continue
-                self.race_machine.try_clear_red(lane, tel.get('is_prestage', False), now)
+                self.race_machine.try_clear_red(
+                    lane, tel.get('is_prestage', False),
+                    self._event_now(lane, tel, now))
 
         # 5. Green-fired falling-edge detection (after update())
         pin_on_fire = self.race_machine.pin_on_fire
@@ -176,8 +226,12 @@ class RaceStateAdapter:
                 def _on_late_burn(ln, t, _lane=lane):
                     self._handle_late_burn(_lane, t)
 
+                # Tempo de EVENTO: o RT passa a medir quando o piloto
+                # LARGOU no relogio sincronizado, nao quando o pacote
+                # chegou — ping alto deixa de virar penalidade no RT.
                 self.timing_engine.detect_launch(
-                    lane, now, pos, speed_kmh, is_staged, spline_s0,
+                    lane, self._event_now(lane, tel, now), pos, speed_kmh,
+                    is_staged, spline_s0,
                     _on_launched, _on_late_burn,
                 )
 
@@ -194,8 +248,10 @@ class RaceStateAdapter:
                 pos = (tel.get('pos_x', 0.0), 0.0, tel.get('pos_z', 0.0))
                 vel = tel.get('vel', 0.0)
 
+                # Tempo de EVENTO tambem nas parciais: alem de casar com o
+                # t0 da largada (evento), elimina o jitter de rede do dt.
                 self.timing_engine.update_partials(
-                    lane, now, lane, tl,
+                    lane, self._event_now(lane, tel, now), lane, tl,
                     lambda cid, _s=spline_val: _s,
                     lambda cid, _p=pos: _p,
                     lambda cid, _v=vel: _v,
@@ -209,6 +265,7 @@ class RaceStateAdapter:
         """Full reset for the next race."""
         self.race_machine.reset()
         self.timing_engine.reset()
+        self._event_now_prev = {}
         self._prev_pin_on_fire = True
         self._prev_timer_running = False
 
@@ -227,7 +284,15 @@ class RaceStateAdapter:
                     self.race_machine.set_stage_position(lane, pos)
 
     def _on_green_fired(self, now):
-        """Green light fires: arm timing for each active non-burned/wo lane."""
+        """Green light fires: arm timing for each active non-burned/wo lane.
+
+        O relogio-zero do RT e o verde AGENDADO (timer_start + duration) —
+        o mesmo instante que os clientes renderizam pela agenda — e nao o
+        `now` do tick em que a borda foi detectada (ate ~8ms depois). Com
+        os eventos carimbados em ts_srv, usar o tick aqui faria uma largada
+        legitima logo apos o verde sair com RT negativo (queima falsa).
+        """
+        sched_green = self.race_machine.get_race_start_time()
         for lane in Lane.all():
             if self.race_machine.lane_burned.get(lane) or self.race_machine.lane_wo.get(lane):
                 continue
@@ -238,7 +303,7 @@ class RaceStateAdapter:
                 continue
             pos = (tel.get('pos_x', 0.0), 0.0, tel.get('pos_z', 0.0))
             stage_pos = self.race_machine.lane_stage_pos0.get(lane)
-            self.timing_engine.on_green_fired(lane, now, pos, stage_pos)
+            self.timing_engine.on_green_fired(lane, sched_green, pos, stage_pos)
 
     def _handle_late_burn(self, lane, now):
         self.race_machine._set_burn_lane(lane, now)

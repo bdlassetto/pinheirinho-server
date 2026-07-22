@@ -94,6 +94,7 @@ class RaceStateMachine:
         self.START_PENDING_S = 1.5
         self.start_pending = False
         self.start_pending_time = 0.0
+        self.start_pending_ready = (False, False)   # snapshot (L,R) ao armar
         
         # --- Per-lane multiplayer state ---
         self.lane_active = {Lane.LEFT: False, Lane.RIGHT: False}
@@ -147,6 +148,7 @@ class RaceStateMachine:
         self.lane_last_ready_time = {Lane.LEFT: 0.0, Lane.RIGHT: 0.0}
         self.start_pending = False
         self.start_pending_time = 0.0
+        self.start_pending_ready = (False, False)   # snapshot (L,R) ao armar
         
         # Lane states
         self.lane_active = {Lane.LEFT: False, Lane.RIGHT: False}
@@ -354,6 +356,12 @@ class RaceStateMachine:
                     FileLogger.critical("RACE_STATE: Staging buffer reset (nobody ready).")
                 self.both_staged_since = None
                 self.waiting_for_opponent_since = None
+                # Cancela tambem um start pendente: se TODO MUNDO saiu da
+                # linha, nao faz sentido a arvore largar sozinha 1.5s
+                # depois com as duas lanes viradas em WO.
+                if self.start_pending:
+                    FileLogger.critical("RACE_STATE: Start pendente cancelado (ninguem pronto).")
+                    self.start_pending = False
             else:
                 # ----------------
                 # A) DUAL STAGE
@@ -372,6 +380,9 @@ class RaceStateMachine:
                             FileLogger.critical("RACE_STATE: Dual staging buffer completed. Sequence start pending.")
                             self.start_pending = True
                             self.start_pending_time = now
+                            # Snapshot: quem estava pronto QUANDO o start
+                            # armou (ver disparo abaixo).
+                            self.start_pending_ready = (True, True)
                 
                 # ----------------
                 # B) SOLO STAGE (Potential WO)
@@ -395,13 +406,22 @@ class RaceStateMachine:
                             FileLogger.critical("RACE_STATE: Solo stage timeout reached. Sequence start pending.")
                             self.start_pending = True
                             self.start_pending_time = now
+                            self.start_pending_ready = (left_ready, right_ready)
 
             if self.start_pending:
                 # During pending state, keep lights live (handled below)
                 if (now - self.start_pending_time) >= self.START_PENDING_S:
-                    # Grace period over - start race based on tolerant state
-                    l_rdy = (now - self.lane_last_ready_time[Lane.LEFT]) <= self.NET_JITTER_TOLERANCE_S
-                    r_rdy = (now - self.lane_last_ready_time[Lane.RIGHT]) <= self.NET_JITTER_TOLERANCE_S
+                    # Prontidao no disparo = quem estava pronto QUANDO o
+                    # start armou OU quem esta pronto agora. Um desalinho
+                    # momentaneo dentro da janela de 1.5s NAO rebaixa um
+                    # piloto (antes: virava WO, sem arvore, vermelha e sem
+                    # cronometragem o run inteiro). Quem sair DE VERDADE
+                    # durante os amarelos e policiado pela deteccao de
+                    # queima — o caso real continua punido. E o "OU agora"
+                    # pega o oponente que alinhou dentro da janela.
+                    armed_l, armed_r = self.start_pending_ready
+                    l_rdy = armed_l or (now - self.lane_last_ready_time[Lane.LEFT]) <= self.NET_JITTER_TOLERANCE_S
+                    r_rdy = armed_r or (now - self.lane_last_ready_time[Lane.RIGHT]) <= self.NET_JITTER_TOLERANCE_S
                     self.start_sequence(now, left_ready=l_rdy, right_ready=r_rdy)
                     self.start_pending = False
 
@@ -422,6 +442,18 @@ class RaceStateMachine:
             else:
                 self.lights.prestage[lane] = self.car_prestage[lane]
                 self.lights.stage[lane] = self.car_stage[lane]
+
+            # Piloto REAL alinhou numa lane marcada como WO (a lane estava
+            # vazia quando a arvore armou, alguem chegou no meio do run):
+            # apaga a vermelha de WO na cara dele. So a LUZ — o status WO
+            # da corrida corrente permanece (semantica de arrancada: ele
+            # nao entra numa corrida ja largada; corre a proxima, que
+            # comeca no reset <=5s apos o lider resolver). Sem isso o
+            # try_clear_red nunca alcancava lanes WO (so trata queimadas)
+            # e o piloto ficava o run inteiro com vermelha acesa.
+            if (self.lane_wo[lane] and self.lights.red[lane]
+                    and self.car_prestage[lane] and self.car_stage[lane]):
+                self.lights.red[lane] = False
 
         # --- Tree Sequence Logic ---
         if self.timer_running:
