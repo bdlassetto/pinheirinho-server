@@ -114,15 +114,23 @@ class RaceStateMachine:
         self.lane_unstage_time = {Lane.LEFT: None, Lane.RIGHT: None}
         
         # --- Red Light Clearing ---
-        # cleared.
-        self.RED_CLEAR_COOLDOWN_S = 8.0
+        # A luz vermelha (queima) apaga assim que o piloto volta e acende o
+        # PRE-STAGE. Guarda: o carro precisa ter SAIDO do feixe desde a
+        # queima antes (lane_departed_since_burn) — senao a vermelha apagaria
+        # no proprio instante da queima, com o carro ainda em cima da linha.
+        self.RED_CLEAR_COOLDOWN_S = 8.0   # mantido para compat (nao usado)
         self.lane_had_full_stage = {Lane.LEFT: False, Lane.RIGHT: False}
+        self.lane_departed_since_burn = {Lane.LEFT: False, Lane.RIGHT: False}
 
     def update_sensor_state(self, lane, is_prestage, is_stage):
         self.car_prestage[lane] = is_prestage
         self.car_stage[lane] = is_stage
         if is_prestage and is_stage:
             self.lane_had_full_stage[lane] = True
+        # Marca que o carro deixou o feixe desde a queima (ambos apagados) —
+        # habilita a vermelha a apagar quando ele voltar ao pre-stage.
+        if self.lane_burned[lane] and not is_prestage and not is_stage:
+            self.lane_departed_since_burn[lane] = True
 
     def reset(self):
         """Full reset of race state — clears all timers, flags, and lights."""
@@ -145,6 +153,7 @@ class RaceStateMachine:
         self.lane_wo = {Lane.LEFT: False, Lane.RIGHT: False}
         self.lane_burned = {Lane.LEFT: False, Lane.RIGHT: False}
         self.lane_burn_time = {Lane.LEFT: None, Lane.RIGHT: None}
+        self.lane_departed_since_burn = {Lane.LEFT: False, Lane.RIGHT: False}
         self.lane_prev_staged = {Lane.LEFT: False, Lane.RIGHT: False}
         self.lane_stage_pos0 = {Lane.LEFT: None, Lane.RIGHT: None}
         
@@ -268,6 +277,7 @@ class RaceStateMachine:
             return
         self.lane_burned[lane] = True
         self.lane_burn_time[lane] = now
+        self.lane_departed_since_burn[lane] = False
 
         # Set red light, turn off green, but ALLOW yellows to animate
         self.lights.red[lane] = True
@@ -291,33 +301,26 @@ class RaceStateMachine:
         return -abs(adv)
 
     def try_clear_red(self, lane, is_on_prestage, now):
-        """Attempts to clear the red light for a burned lane.
+        """Apaga a luz vermelha (queima) quando o piloto volta e acende o
+        PRE-STAGE. Regras:
+          1. A lane precisa ter queimado.
+          2. O carro precisa ter SAIDO do feixe desde a queima (senao a
+             vermelha apagaria no proprio instante da queima, com o carro
+             ainda em cima da linha).
+          3. O carro precisa estar AGORA no pre-stage.
 
-        Rules:
-          1. Lane must be burned.
-          2. At least RED_CLEAR_COOLDOWN_S (8s) must have passed since
-             the green light was fired (not since burn time).
-          3. The driver must currently be on the pre-stage sensor.
-
-        When cleared, the red light turns off so the driver doesn't have
-        to sit with it for the rest of the run.
-
-        Returns True if the red was cleared.
+        Sem espera por tempo: assim que acende o pre-stage (tendo saido
+        antes), a vermelha apaga. Retorna True se apagou.
         """
         if not self.lane_burned[lane]:
             return False
 
         if not self.lights.red[lane]:
-            return False  # Already cleared
+            return False  # ja apagada
 
-        # Compute time since green fired
-        green_time = self.timer_start + self.timer_duration
-        if now - green_time < self.RED_CLEAR_COOLDOWN_S:
-            return False  # Still in cooldown
+        if not self.lane_departed_since_burn[lane]:
+            return False  # ainda nao saiu do feixe desde a queima
 
-        # Rule 3 (was documented but never enforced): the driver must be
-        # back on the pre-stage sensor — the red must not clear by time
-        # alone with the car anywhere on the track.
         if not is_on_prestage:
             return False
 
