@@ -405,22 +405,41 @@ class RaceServer:
         else:
             room.run_started_at = None
 
-        # Race-end detection: all active, non-wo lanes have either t201 or burned
+        # Race-end detection: cada lane ativa (nao-WO) esta RESOLVIDA quando:
+        #   - completou (t201), OU
+        #   - queimou, OU
+        #   - ABORTOU: largou (tem RT) mas nao completou e voltou totalmente
+        #     alinhada na largada (o piloto desistiu e voltou pra tentar de
+        #     novo). Sem isso, uma largada abortada so era encerrada pelo
+        #     watchdog de 60s — visto ao vivo na pista de Londrina.
         if state.get('run_active') and not state.get('pin_on_fire') and not state.get('timer_running'):
             active_lanes = [
                 ln for ln in LANES
                 if state['lane_active'].get(ln) and not state['lane_wo'].get(ln)
             ]
-            if active_lanes and all(
-                state['stats'][ln].get('t201') is not None or state['lane_burned'].get(ln)
-                for ln in active_lanes
-            ):
+
+            def _lane_resolved(ln):
+                s = state['stats'][ln]
+                if s.get('t201') is not None or state['lane_burned'].get(ln):
+                    return True
+                # aborto: largou (rt) porem sem completar e re-alinhado
+                launched = s.get('rt') is not None
+                return launched and room.adapter.is_lane_fully_staged(ln, now)
+
+            if active_lanes and all(_lane_resolved(ln) for ln in active_lanes):
                 if room.race_ended_at is None:
                     room.race_ended_at = now
                     room.finished_lanes = set(active_lanes)
                     room.lanes_confirmed_departed = set()
-                    logger.info("Race done (room=%s). Reset in up to %.0fs (sooner if driver(s) realign).",
-                                room.key, POST_RACE_RESET_DELAY)
+                    aborted = [ln for ln in active_lanes
+                               if state['stats'][ln].get('t201') is None
+                               and not state['lane_burned'].get(ln)]
+                    if aborted:
+                        logger.info("Largada abortada (room=%s, lanes=%s). Reset em ate %.0fs.",
+                                    room.key, aborted, POST_RACE_RESET_DELAY)
+                    else:
+                        logger.info("Race done (room=%s). Reset in up to %.0fs (sooner if driver(s) realign).",
+                                    room.key, POST_RACE_RESET_DELAY)
                     self._save_result(room, state)
 
         if room.race_ended_at is not None:

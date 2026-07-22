@@ -47,7 +47,10 @@ class TimingEngine:
 
     @staticmethod
     def _new_partials():
-        return {"running": False, "done": False, "t0": 0.0, "p0": None, "s0": None}
+        # arc/prev_pos/prev_dir: distancia por COMPRIMENTO DE ARCO (segue a
+        # tangente do trajeto). Ver update_partials — funciona em pista curva.
+        return {"running": False, "done": False, "t0": 0.0, "p0": None, "s0": None,
+                "arc": 0.0, "prev_pos": None, "prev_dir": None}
 
     @staticmethod
     def _new_stats():
@@ -147,6 +150,11 @@ class TimingEngine:
             self.lane_partials[lane]["done"] = False
             self.lane_partials[lane]["t0"] = now
             self.lane_partials[lane]["s0"] = spline_s0
+            # Zera o acumulador de arco na largada; a 1a leitura de posicao
+            # em update_partials vira a origem do trajeto.
+            self.lane_partials[lane]["arc"] = 0.0
+            self.lane_partials[lane]["prev_pos"] = None
+            self.lane_partials[lane]["prev_dir"] = None
 
             on_launched(lane, rt)
 
@@ -164,47 +172,61 @@ class TimingEngine:
         self.lane_partials[lane]["done"] = True
         self._recalc_sum(lane)
 
+    # Passo entre quadros maior que isto = teleporte (reset pra box, etc.):
+    # ignora para nao inflar a distancia. A ~170 km/h e 50 Hz o passo real
+    # e ~1 m; 15 m seria >2700 km/h, impossivel.
+    MAX_STEP_M = 15.0
+
     def update_partials(self, lane, now, car_id, track_length, get_spline_fn,
                         get_pos_fn, get_speed_fn, lane_forward_fn,
                         on_split_done):
         """Updates partial times (60ft, 100m, 201m) for one lane.
 
+        DISTANCIA POR COMPRIMENTO DE ARCO (segue a tangente do trajeto):
+        acumula o deslocamento quadro-a-quadro do carro. Antes projetava
+        (pos - p0) num vetor FIXO — o que so vale em reta; numa pista de
+        arrancada em CURVA (ex.: Londrina) a projecao no eixo fixo cresce
+        cada vez menos conforme o carro segue a curva e as parciais travavam
+        no meio (visto ao vivo: 60ft em 8s, 100m/201m nunca). Somando o
+        passo na direcao instantanea de cada quadro, a distancia segue
+        qualquer curva sem precisar de track_length nem vetor da pista.
+
+        Guardas: passo > MAX_STEP_M e teleporte (ignora); passo que inverte
+        o sentido (produto escalar < 0 com o passo anterior) nao conta —
+        assim voltar de re depois de largar nao avanca as parciais.
+
         Parameters (callables):
-          get_spline_fn(car_id) -> float or None
-          get_pos_fn(car_id)    -> (x,y,z) or None
-          get_speed_fn(car_id)  -> float or None
-          lane_forward_fn(lane) -> (fx, fz)
+          get_pos_fn(car_id)    -> (x,y,z) or None   (usada)
+          get_speed_fn(car_id)  -> float or None      (usada na vfinal)
+          get_spline_fn/lane_forward_fn: mantidas por compat; nao usadas aqui.
           on_split_done(lane, key, value) — callback for each hit split
         """
         pp = self.lane_partials[lane]
         if (not pp["running"]) or pp["done"]:
             return
 
-        dist = None
-        s0 = pp.get("s0")
-        if track_length and s0 is not None:
-            s1 = get_spline_fn(car_id)
-            if s1 is not None:
-                d = float(s1) - float(s0)
-                if d < 0.0:
-                    d += 1.0
-                if d < 0.0:
-                    d = 0.0
-                if d <= 0.5:
-                    dist = d * track_length
+        pos = get_pos_fn(car_id)
+        if not pos:
+            return
 
-        if dist is None:
-            pos = get_pos_fn(car_id)
-            if not pos:
-                return
-            p0 = pp["p0"]
-            if not p0:
-                return
-            fx, fz = lane_forward_fn(lane)
-            dx = pos[0] - p0[0]
-            dz = pos[2] - p0[2]
-            d_proj = dx * fx + dz * fz
-            dist = d_proj if d_proj > 0.0 else 0.0
+        prev = pp.get("prev_pos")
+        if prev is None:
+            # 1a leitura pos-largada: fixa a origem do trajeto, distancia 0.
+            pp["prev_pos"] = (pos[0], pos[2])
+            dist = 0.0
+        else:
+            dx = pos[0] - prev[0]
+            dz = pos[2] - prev[1]
+            step = math.sqrt(dx * dx + dz * dz)
+            if step > self.MAX_STEP_M:
+                pass                     # teleporte: ignora, nao move origem
+            elif step > 1e-4:
+                pdir = pp.get("prev_dir")
+                if pdir is None or (dx * pdir[0] + dz * pdir[1]) > 0.0:
+                    pp["arc"] += step    # avanca so quando nao inverteu
+                    pp["prev_dir"] = (dx / step, dz / step)
+                pp["prev_pos"] = (pos[0], pos[2])
+            dist = pp["arc"]
 
         dt = now - float(pp["t0"] or now)
         if dt < 0:
