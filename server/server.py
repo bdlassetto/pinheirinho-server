@@ -59,6 +59,12 @@ from race_state_adapter import RaceStateAdapter
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(
+            os.path.join(os.path.dirname(__file__), 'server.log'),
+            encoding='utf-8'),
+    ],
 )
 logger = logging.getLogger('RaceServer')
 
@@ -100,6 +106,7 @@ class Room:
         self.clients = {}       # websocket -> info dict (shared with server)
         self.lanes = {}         # lane -> websocket (racers only)
         self.lane_pilots = {}   # lane -> pilot display name
+        self.lane_claimed_at = {}  # lane -> time.time() da ultima reivindicacao
         self.adapter = RaceStateAdapter()
         self.last_broadcast = None
         self.race_ended_at = None
@@ -169,6 +176,32 @@ class RaceServer:
             room.lanes_confirmed_departed = set()
             room.last_broadcast = None
 
+    # Folga acima de TELEMETRY_FRESH_S (1.0s) antes de considerar uma lane
+    # abandonada por queda de rede/crash. Maior que o frescor normal do
+    # sensor para nao confundir uma reconexao rapida com posse morta.
+    STALE_LANE_GRACE_S = 3.0
+
+    def _evict_stale_lane_owner(self, room, lane, owner):
+        """Derruba a posse de uma lane cujo dono parou de mandar telemetria.
+
+        Usado quando um novo REGISTER chega para uma lane 'ocupada', mas o
+        dono anterior sumiu sem fechar o websocket direito (crash, queda de
+        rede) — sem isto, a lane ficava travada em LANE_TAKEN ate o timeout
+        de ping/pong do websocket (ate ~30s, ping_interval+ping_timeout).
+        """
+        old_info = room.clients.pop(owner, None)
+        if room.lanes.get(lane) is owner:
+            del room.lanes[lane]
+        self._resolve_lane_on_disconnect(room, lane)
+        room.adapter.clear_lane(lane)
+        room.lane_pilots.pop(lane, None)
+        room.lane_claimed_at.pop(lane, None)
+        if old_info is not None:
+            old_info['room'] = None
+            old_info['lane'] = None
+        logger.info("Lane %s liberada: dono anterior sem telemetria fresca (room=%s).",
+                    lane, room.key)
+
     def _leave_room(self, websocket, info):
         """Remove a connection from its room, releasing its lane."""
         room_key = info.get('room')
@@ -186,6 +219,7 @@ class RaceServer:
             self._resolve_lane_on_disconnect(room, lane)
             room.adapter.clear_lane(lane)
             room.lane_pilots.pop(lane, None)
+            room.lane_claimed_at.pop(lane, None)
             freed_lane = lane
         info['room'] = None
         info['lane'] = None
@@ -335,13 +369,39 @@ class RaceServer:
                 return
             owner = room.lanes.get(lane)
             if owner is not None and owner is not websocket and owner in room.clients:
-                logger.info("Lane claim DENIED (taken): room=%s lane=%s", room.key, lane)
-                await self._send(websocket, {'type': 'LANE_TAKEN', 'lane': lane})
-                if info['role'] is None:
-                    info['role'] = 'spectator'
-                    await self._send(websocket, {'type': 'REGISTER_ACK', 'role': 'spectator'})
-                    await self._send_current_state(room, websocket)
-                return
+                now = time.time()
+                tel = room.adapter._telemetry.get(lane)
+                if tel is not None:
+                    tel_age = room.adapter._tel_age(tel, now)
+                else:
+                    # Ainda nao mandou TELEMETRY: normal logo apos o
+                    # REGISTER (a primeira telemetria so chega no proximo
+                    # frame do cliente). So conta como abandonada se a
+                    # propria reivindicacao da lane ja e mais velha que a
+                    # folga — senao um dono recem-conectado seria despejado
+                    # instantaneamente por qualquer outro REGISTER.
+                    claimed_at = room.lane_claimed_at.get(lane)
+                    tel_age = (now - claimed_at) if claimed_at is not None else float('inf')
+                if tel_age > self.STALE_LANE_GRACE_S:
+                    self._evict_stale_lane_owner(room, lane, owner)
+                    owner = None
+                else:
+                    logger.info("Lane claim DENIED (taken): room=%s lane=%s", room.key, lane)
+                    await self._send(websocket, {'type': 'LANE_TAKEN', 'lane': lane})
+                    # Se esta conexao ACHAVA que era dona desta MESMA lane
+                    # (reconectando, ou perdeu a posse pra quem acabou de
+                    # reivindicar), tem que parar de se achar dona agora —
+                    # senao ela continua mandando TELEMETRY marcada com essa
+                    # lane, que vai sendo gravada por cima da telemetria do
+                    # dono de verdade (sensor piscando, posicao errada, e
+                    # queima fantasma no arme visto ao vivo).
+                    if info.get('lane') == lane:
+                        info['lane'] = None
+                    if info['role'] is None:
+                        info['role'] = 'spectator'
+                        await self._send(websocket, {'type': 'REGISTER_ACK', 'role': 'spectator'})
+                        await self._send_current_state(room, websocket)
+                    return
 
             # Release a previously held lane if switching sides
             prev = info.get('lane')
@@ -349,10 +409,12 @@ class RaceServer:
                 del room.lanes[prev]
                 room.adapter.clear_lane(prev)
                 room.lane_pilots.pop(prev, None)
+                room.lane_claimed_at.pop(prev, None)
 
             info['role'] = 'racer'
             info['lane'] = lane
             room.lanes[lane] = websocket
+            room.lane_claimed_at[lane] = time.time()
 
             pilot = msg.get('pilot')
             if pilot:
@@ -421,6 +483,26 @@ class RaceServer:
             await asyncio.sleep(max(0.0, TICK_INTERVAL - elapsed))
 
     async def _tick_room(self, room, now):
+        # Varredura proativa de lane fantasma: sem isto, uma lane so era
+        # liberada quando ALGUEM tentava se registrar nela (REGISTER),
+        # entao o nome do piloto antigo e as parciais continuavam
+        # atribuidos a ele ate esse proximo REGISTER acontecer — visto ao
+        # vivo: piloto novo entrou fisicamente na lane, mas o nome antigo
+        # nao sumiu e as parciais contaram para ele. Aqui a gente libera a
+        # lane assim que a telemetria dela envelhece, todo tick, sem
+        # depender de ninguem tentar reivindica-la.
+        for lane in list(room.lanes.keys()):
+            owner = room.lanes.get(lane)
+            if owner is None:
+                continue
+            tel = room.adapter._telemetry.get(lane)
+            tel_age = room.adapter._tel_age(tel, now) if tel is not None else float('inf')
+            if tel is None:
+                claimed_at = room.lane_claimed_at.get(lane)
+                tel_age = (now - claimed_at) if claimed_at is not None else float('inf')
+            if tel_age > self.STALE_LANE_GRACE_S:
+                self._evict_stale_lane_owner(room, lane, owner)
+
         # Only racers count as active cars (spectators must not affect
         # the WO/solo staging timeout logic).
         active_cars = len(room.lanes)
