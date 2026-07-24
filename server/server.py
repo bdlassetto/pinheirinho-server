@@ -44,6 +44,7 @@ Protocol (server -> client):
     {"type": "OPPONENT_DISCONNECTED", "lane": "left"}
 """
 import asyncio
+import http
 import json
 import logging
 import os
@@ -67,6 +68,13 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger('RaceServer')
+
+# Numa porta publica, bots/scanners sondam o tempo todo (HTTP comum, metodo
+# CONNECT de proxy-scanner, lixo sem CRLF). A lib websockets loga cada
+# handshake invalido desses como ERROR com traceback completo, enchendo o
+# log de ruido assustador que nao e problema nenhum — o servidor rejeita e
+# segue. Silencia a lib (nossos logs vao pelo logger 'RaceServer', separado).
+logging.getLogger('websockets').setLevel(logging.CRITICAL)
 
 HOST = '0.0.0.0'
 # Porta: em hosts tipo Pterodactyl a porta e alocada pelo painel e chega
@@ -690,11 +698,36 @@ class RaceServer:
             logger.info("Room removed (empty, dead-broadcast): %s", room.key)
 
 
+def health_check(connection, request):
+    """Responde a um GET HTTP comum (navegador, monitor, bot) com um status
+    legivel — assim da pra confirmar que o servidor esta no ar so abrindo
+    http://IP:PORTA no navegador. Um cliente WebSocket de verdade manda o
+    header 'Upgrade: websocket'; nesse caso devolve None e deixa o handshake
+    do WebSocket seguir normal."""
+    upgrade = request.headers.get("Upgrade", "")
+    if upgrade.lower() == "websocket":
+        return None
+    body = (
+        "Pinheirinho BDL Race Server: ONLINE\n"
+        "Este endereco e um servidor WebSocket (ws://), nao um site.\n"
+        "O app do Assetto Corsa conecta aqui automaticamente.\n"
+        "Salas ativas: {}\n".format(len(race_server_ref.get('srv').rooms)
+                                    if race_server_ref.get('srv') else 0)
+    )
+    return connection.respond(http.HTTPStatus.OK, body)
+
+
+# Referencia global pro health_check acessar o servidor (rooms count).
+race_server_ref = {'srv': None}
+
+
 async def main():
     race_server = RaceServer()
+    race_server_ref['srv'] = race_server
     async with websockets.serve(
         race_server.handle_client, HOST, PORT,
         ping_interval=20, ping_timeout=10,
+        process_request=health_check,
     ):
         logger.info("Pinheirinho2 Race Server on ws://%s:%d", HOST, PORT)
         tick_task = asyncio.create_task(race_server.tick_loop())
